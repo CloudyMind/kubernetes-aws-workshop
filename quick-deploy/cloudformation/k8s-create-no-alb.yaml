@@ -596,9 +596,8 @@ Outputs:
   GeneratedToken:
     Description: Kubernetes Token to Join Nodes
     Value: !Sub "${KubernetesToken.Token}"
-  MoveExistingConfig:
-    Value: mv $HOME/.kube/config $HOME/.kube/config_old
-    Description: Replace existing config file with newly generated
+#  MoveExistingConfig:
+#    Value: mv $HOME/.kube/config $HOME/.kube/config_old
   KubeConfig:
     Value: !Join 
       - ''
@@ -608,15 +607,14 @@ Outputs:
         - !GetAtt 
           - Master
           - PublicIp
-        - :.kube/config $HOME/.kube/
-        - !Ref AWS::Region
-        - -kubeconfig
-    Description: SCP command to pull config
-  KubeConfigExport:
-    Value: !Join 
-      - ''
-      - - 'export KUBECONFIG=$HOME/.kube/'
-        - !Ref AWS::Region
-        - -kubeconfig:$HOME/.kube/config
-    Description: Set export variable for config location
+        - ':.kube/config $HOME/.kube/'
+        - !Ref KeyName
+        - '-config'
+        - ' '
+        - 'export KUBECONFIG=$HOME/.kube/'
+        - !Ref KeyName
+        - '-config'
+        - ':$HOME/.kube/config'
+        - ' '
+        - 'kubectl config use-context kubernetes-admin@kubernetes'
 
