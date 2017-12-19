@@ -2,17 +2,21 @@
 :linkcss:
 :imagesdir: ../images
 
-= Kubernetes ConfigMap and Secrets
+= Application Configuration and Secrets
 :toc:
 
-Kubernetes has resource types that allows to decouple application code from configuration. It makes the applications to be more portable. This chapter will cover how ConfigMap and Secrets can be used to do that.
+Separating application code from configuration is one of the factors when building an application using https://12factor.net/[12-factor]. This allows the same application to be deployed across multiple environments, such as dev, test, staging and production. It also allows the application to be more portable.
+
+Kubernetes has native constructs like _ConfigMap_ and _Secrets_ that allow you to decouple configuration artifacts from the image content to keep containerized applications portable. In addition, other services as https://aws.amazon.com/ec2/systems-manager/parameter-store/[AWS Parameter Store] or https://www.vaultproject.io/[Hashicorp Vault] can be used to store that information as well.
+
+This chapter will cover how these constructs and services can be used to store configuration information and secrets.
 
 . ConfigMap is just a set of key-value pairs. It allow you to decouple configuration artifacts from image content.
 . Secrets allows separating sensitive information such as credentials and keys from an application.
 
 ConfigMap is similar to Secrets, but provides a means of working with strings that don’t contain sensitive information.
 
-This section will explain how to use ConfigMap and Secrets. Make sure you change to that directory before giving any commands in this chapter.
+Make sure you change to that directory before giving any commands in this chapter.
 
 == Prerequisites
 
@@ -20,7 +24,7 @@ This chapter uses a cluster with 3 master nodes and 5 worker nodes as described 
 
 All configuration files for this chapter are in the `config-secrets` directory.
 
-== ConfigMap
+== Configuration data using Kubernetes ConfigMap
 
 This section will explain:
 
@@ -311,7 +315,7 @@ The pod logs are refreshed as well:
   Hello world 2
   Hello world 3
 
-== Secrets
+== Secrets using Kubernetes Secrets
 
 In this section we will demonstrate how to place secrets into the Kubernetes cluster and then show multiple ways of retrieving those secretes from within a pod.
 
@@ -439,4 +443,564 @@ Open a shell to the pod to see the secrets:
     echo $SECRET_PASSWORD
 
 The above commands illustrate how to see the secret values via environment variables.
+
+== Configuration data and Secrets using AWS Parameter Store
+
+https://aws.amazon.com/ec2/systems-manager/[Amazon EC2 Systems Manager] eases the configuration and management of Amazon EC2 instances and associated resources. One of the features of Systems Manager is https://aws.amazon.com/ec2/systems-manager/parameter-store/[Parameter Store] that provides a centralized location to store, provide access control, and easily reference your configuration data, whether plain-text data such as database strings or secrets such as passwords, encrypted through https://aws.amazon.com/kms/[AWS Key Management Service] (KMS).
+
+KMS helps you encrypt your sensitive information and protect the security of your keys. Additionally, all calls to the parameter store are recorded with AWS CloudTrail so that they can be audited. Access to each parameter store secrets can be scoped with IAM.
+
+Parameter Store allows three types of configuration data to be stored:
+
+- String
+- List of string
+- Secure string
+
+This section will show how to create a secure string using AWS CLI and access it in a Pod.
+
+=== Create KMS Key
+
+. Create a new encryption key: https://console.aws.amazon.com/iam/home#/encryptionKeys/
+. Click on `Create key`. If you haven't used the KMS service before, click `Get Started`.
+. Specify the `Alias` as `k8s-key`
++
+image::aws-kms-create-key.png[]
++
+Click on `Next Step`.
+. Take the defaults for `Add Tags` and click on `Next Step`.
+. Select the IAM user(s) and roles that can administer this key through the KMS API
++
+image::aws-kms-key-admins.png[]
++
+. Select the IAM user(s) and roles that can use this key to encrypt and decrypt data from within applications. We'll use the IAM role that is assigned to the worker nodes in the Kubernetes cluster created by kops.
++
+image::aws-kms-key-usage-perms.png[]
++
+. Preview key policy:
+
+  {
+    "Id": "key-consolepolicy-3",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "Enable IAM User Permissions",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": [
+            "arn:aws:iam::<account-id>:root"
+          ]
+        },
+        "Action": "kms:*",
+        "Resource": "*"
+      },
+      {
+        "Sid": "Allow access for Key Administrators",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": [
+            "arn:aws:iam::<account-id>:user/arun",
+            "arn:aws:iam::<account-id>:role/nodes.example.cluster.k8s.local"
+          ]
+        },
+        "Action": [
+          "kms:Create*",
+          "kms:Describe*",
+          "kms:Enable*",
+          "kms:List*",
+          "kms:Put*",
+          "kms:Update*",
+          "kms:Revoke*",
+          "kms:Disable*",
+          "kms:Get*",
+          "kms:Delete*",
+          "kms:TagResource",
+          "kms:UntagResource",
+          "kms:ScheduleKeyDeletion",
+          "kms:CancelKeyDeletion"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "Allow use of the key",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": [
+            "arn:aws:iam::<account-id>:role/nodes.example.cluster.k8s.local"
+          ]
+        },
+        "Action": [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "Allow attachment of persistent resources",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": [
+            "arn:aws:iam::<account-id>:role/nodes.example.cluster.k8s.local"
+          ]
+        },
+        "Action": [
+          "kms:CreateGrant",
+          "kms:ListGrants",
+          "kms:RevokeGrant"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "Bool": {
+            "kms:GrantIsForAWSResource": true
+          }
+        }
+      }
+    ]
+  }
+
+. Click on `Finish`.
+. Select `IAM`, `Encryption Keys`, `k8s-key` and copy the ARN of the key.
+
+=== Update the IAM role
+
+For a Kubernetes cluster created by kops, EC2 worker nodes use an instance profile to allow the EC2 instances to access other AWS services. This role must be updated to allow the worker nodes to read the secrets from Parameter Store.
+
+In the IAM Console click `roles` and type `nodes` into the search box. Find the `nodes.example.cluster.k8s.local` role
+and click it. In the Permissions tab, expand the inline policy for `nodes.example.cluster.k8s.local` and click
+`Edit policy`. Add the `ssm:GetParameter` permission to the policy so the policy looks similar to the one below.
+
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            .
+            .
+            .
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "ssm:GetParameter"
+                ],
+                "Resource": [
+                    "arn:aws:ssm:<region>:<account-id>:parameter/GREETING",
+                    "arn:aws:ssm:<region>:<account-id>:parameter/NAME"
+                ]
+            }
+        ]
+    }
+
+=== Create secrets
+
+Only the value of the secure string parameter is encrypted. The name of the parameter, description, and other properties are not encrypted.
+
+. A secret in AWS Parameter is created as a secure string. Create a secure string:
++
+  $ aws ssm put-parameter \
+    --name GREETING \
+    --value Hello \
+    --type SecureString \
+    --key-id arn:aws:kms:<region>:<account-id>:key/414a963b-7fe4-4a61-b19f-ea408b9bda3b
+  {
+      "Version": 1
+  }
++
+This will create a secret in the Parameter Store using the KMS key.
++
+. Get the value of the created secret:
++
+```
+$ aws ssm get-parameter --name GREETING
+{
+    "Parameter": {
+        "Version": 1, 
+        "Type": "SecureString", 
+        "Name": "GREETING", 
+        "Value": "AQICAHghFIWYznvdUrX6qDhd5xLFHpoaQ5WL1EaHqsbkenfFEwHdqTpU8URwKMf2H9XmMyMgAAAAYzBhBgkqhkiG9w0BBwagVDBSAgEAME0GCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQM0jZaUadELhmiCzj4AgEQgCBXVAZzfjac8P2AFrelnLaXb3z7ssZt2q/npxYAdJ9ABQ=="
+    }
+}
+```
++
+By default, the encrypted value of the secret is shown in the output.
++
+. Decrypted value of the secret can be obtained:
+
+  $ aws ssm get-parameter --name GREETING --with-decryption
+  {
+      "Parameter": {
+          "Version": 1, 
+          "Type": "SecureString", 
+          "Name": "GREETING", 
+          "Value": "Hello"
+      }
+  }
+
+. Create another secret:
+
+  $ aws ssm put-parameter \
+    --name NAME \
+    --value World \
+    --type SecureString \
+    --key-id arn:aws:kms:<region>:<account-id>:key/414a963b-7fe4-4a61-b19f-ea408b9bda3b
+  {
+      "Version": 1
+  }
++
+These two secrets will be consumed in the Pod.
+
+=== Consume secrets in a Pod
+
+The directory `images/parameter-store-kubernetes` contains a Java application that reads secrets from AWS Parameter Store. This application is then packaged as a Pod and deployed in the cluster.
+
+The Pod configuration is shown:
+
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: pod-parameter-store
+  spec:
+    containers:
+    - name: pod-parameter-store
+      image: arungupta/parameter-store-kubernetes:latest
+    restartPolicy: Never
+
+Create the Pod:
+
+  $ kubectl apply -f templates/pod-parameter-store.yaml
+  pod "pod-parameter-store" configured
+
+Check the logs of the Pod:
+
+  $ kubectl logs pod-parameter-store
+  parameter store: HelloWorld
+
+This shows that the Java application has been able to read both the NAME and GREETING secrets from AWS Parameter Store.
+
+== Secrets using Vault
+
+https://www.vaultproject.io/[Hashicorp Vault] is a tool for managing secrets. It secures, stores and tightly controls access to tokens, passwords, certificates, API keys and other secrets.
+
+This section explains how to install and configure Vault on AWS, store secrets, and access them in a Pod. The instructions are inspired from https://github.com/briankassouf/vault-kubernetes-demo.
+
+=== Create EC2 instance
+
+We need an EC2 instance for hosting Vault server. This server needs to be accessible to Kubernetes cluster.
+
+. Create an EC2 instance with Linux flavor. For example `m4.large` with `Amazon Linux`
+.. Make sure to allow port `8200` as part of `Configure Security Group`
+.. Configure security group to allow 8200 (not TLS by default, more config required for TLS)
+.. SSH into the machine:
++
+```
+ssh -i ~/.ssh/arun-us-east1.pem ec2-user@ec2-54-237-223-40.compute-1.amazonaws.com
+```
++
+. Note down the private IP address of the EC2 console. This is needed to start our Vault server.
+
+=== Start Vault Server on EC2
+
+. Download Vault server:
+
+  wget https://releases.hashicorp.com/vault/0.9.0/vault_0.9.0_linux_amd64.zip
+
+. Unzip Vault: `unzip vault_0.9.0_linux_amd64.zip`
+. Start Vault server:
++
+```
+[ec2-user@ip-172-31-26-180 ~]$ ./vault server -dev-listen-address=ip-172-31-26-180.ec2.internal:8200 -dev &
+[1] 26687
+[ec2-user@ip-172-31-26-180 ~]$ ==> Vault server configuration:
+
+                     Cgo: disabled
+         Cluster Address: https://ip-172-31-26-180.ec2.internal:8201
+              Listener 1: tcp (addr: "ip-172-31-26-180.ec2.internal:8200", cluster address: "172.31.26.180:8201", tls: "disabled")
+               Log Level: info
+                   Mlock: supported: true, enabled: false
+        Redirect Address: http://ip-172-31-26-180.ec2.internal:8200
+                 Storage: inmem
+                 Version: Vault v0.9.0
+             Version Sha: bdac1854478538052ba5b7ec9a9ec688d35a3335
+
+==> WARNING: Dev mode is enabled!
+
+In this mode, Vault is completely in-memory and unsealed.
+Vault is configured to only have a single unseal key. The root
+token has already been authenticated with the CLI, so you can
+immediately begin using the Vault CLI.
+
+The only step you need to take is to set the following
+environment variables:
+
+    export VAULT_ADDR='http://ip-172-31-26-180.ec2.internal:8200'
+
+The unseal key and root token are reproduced below in case you
+want to seal/unseal the Vault or play with authentication.
+
+Unseal Key: ZBfexpmasu0r4iba+t8tTlm4L5FQJ+JagglEhbfpxkU=
+Root Token: 4e93b3c6-c459-f166-e7e9-6c48044cfdb6
+
+==> Vault server started! Log data will stream in below:
+
+2017/11/20 03:34:06.457231 [INFO ] core: security barrier not initialized
+2017/11/20 03:34:06.457349 [INFO ] core: security barrier initialized: shares=1 threshold=1
+2017/11/20 03:34:06.457475 [INFO ] core: post-unseal setup starting
+2017/11/20 03:34:06.470532 [INFO ] core: loaded wrapping token key
+2017/11/20 03:34:06.470542 [INFO ] core: successfully setup plugin catalog: plugin-directory=
+2017/11/20 03:34:06.471226 [INFO ] core: successfully mounted backend: type=kv path=secret/
+2017/11/20 03:34:06.471239 [INFO ] core: successfully mounted backend: type=cubbyhole path=cubbyhole/
+2017/11/20 03:34:06.471348 [INFO ] core: successfully mounted backend: type=system path=sys/
+2017/11/20 03:34:06.471530 [INFO ] core: successfully mounted backend: type=identity path=identity/
+2017/11/20 03:34:06.475065 [INFO ] expiration: restoring leases
+2017/11/20 03:34:06.475241 [INFO ] rollback: starting rollback manager
+2017/11/20 03:34:06.475583 [INFO ] expiration: lease restore complete
+2017/11/20 03:34:06.475583 [INFO ] identity: entities restored
+2017/11/20 03:34:06.475628 [INFO ] identity: groups restored
+2017/11/20 03:34:06.475641 [INFO ] core: post-unseal setup complete
+2017/11/20 03:34:06.475778 [INFO ] core: root token generated
+2017/11/20 03:34:06.475782 [INFO ] core: pre-seal teardown starting
+2017/11/20 03:34:06.475783 [INFO ] core: cluster listeners not running
+2017/11/20 03:34:06.475790 [INFO ] rollback: stopping rollback manager
+2017/11/20 03:34:06.475848 [INFO ] core: pre-seal teardown complete
+2017/11/20 03:34:06.475905 [INFO ] core: vault is unsealed
+2017/11/20 03:34:06.475919 [INFO ] core: post-unseal setup starting
+2017/11/20 03:34:06.475965 [INFO ] core: loaded wrapping token key
+2017/11/20 03:34:06.475967 [INFO ] core: successfully setup plugin catalog: plugin-directory=
+2017/11/20 03:34:06.476108 [INFO ] core: successfully mounted backend: type=kv path=secret/
+2017/11/20 03:34:06.476186 [INFO ] core: successfully mounted backend: type=system path=sys/
+2017/11/20 03:34:06.476318 [INFO ] core: successfully mounted backend: type=identity path=identity/
+2017/11/20 03:34:06.476328 [INFO ] core: successfully mounted backend: type=cubbyhole path=cubbyhole/
+2017/11/20 03:34:06.476889 [INFO ] expiration: restoring leases
+2017/11/20 03:34:06.476945 [INFO ] rollback: starting rollback manager
+2017/11/20 03:34:06.477008 [INFO ] identity: entities restored
+2017/11/20 03:34:06.477015 [INFO ] identity: groups restored
+2017/11/20 03:34:06.477022 [INFO ] core: post-unseal setup complete
+2017/11/20 03:34:06.477105 [INFO ] expiration: lease restore complete
+```
++
+. Run the command to configure Vault CLI to identify the server:
++
+```
+export VAULT_ADDR='http://ip-172-31-26-180.ec2.internal:8200'
+```
++
+. Check status:
++
+```
+[ec2-user@ip-172-31-26-180 ~]$ ./vault status
+Type: shamir
+Sealed: false
+Key Shares: 1
+Key Threshold: 1
+Unseal Progress: 0
+Unseal Nonce: 
+Version: 0.9.0
+Cluster Name: vault-cluster-01043c83
+Cluster ID: 89ccbeb4-8af1-7dca-77bb-38f39c423a39
+
+High-Availability Enabled: false
+```
+
+=== Configure Vault CLI on your local machine
+
+. Download Vault server:
+
+  wget https://releases.hashicorp.com/vault/0.9.0/vault_0.9.0_linux_amd64.zip
+
+. Unzip Vault: `unzip vault_0.9.0_linux_amd64.zip`
+
+. Find public IP address of the EC2 instance and setup an environment variable:
+
+  export VAULT_ADDR='<public-ip-address>'
++
+For example, this command will look like:
++  
+  export VAULT_ADDR='http://http://ec2-54-237-223-40.compute-1.amazonaws.com:8200'
++
+. Verify the status can be seen from your local machine:
++
+```
+$ vault status
+Type: shamir
+Sealed: false
+Key Shares: 1
+Key Threshold: 1
+Unseal Progress: 0
+Unseal Nonce: 
+Version: 0.9.0
+Cluster Name: vault-cluster-01043c83
+Cluster ID: 89ccbeb4-8af1-7dca-77bb-38f39c423a39
+
+High-Availability Enabled: false
+```
+
+. Authenticate against Vault using the root token from the output when starting vault:
++
+```
+vault auth
+Token (will be hidden):
+Successfully authenticated! You are now logged in.
+token: 4e93b3c6-c459-f166-e7e9-6c48044cfdb6
+token_duration: 0
+token_policies: [root]
+```
+
+=== Configure Kubernetes Service Account
+
+. Create the service account to verify service account token during login:
+
+  $ kubectl create -f templates/vault-reviewer.yaml
+  serviceaccount "vault-reviewer" created
+
+. Create the RBAC role that will be used by the service account to access the TokenReview API:
+
+  $ kubectl apply -f templates/vault-reviewer-rbac.yaml 
+  clusterrolebinding "role-tokenreview-binding" created
+
+. Creat a service account that will be used to login to the auth backend:
+
+  $ kubectl create -f templates/vault-auth.yaml
+  serviceaccount "vault-auth" created
+
+=== Configure Kubernetes Auth backend
+
+Service account token, Kubernetes API server address and the certificate used to access the API server are needed in order to configure the Kubernetes Auth backend. Let's get these values.
+
+. On the local machine, read the service account token:
+
+  kubectl get secret \
+  $(kubectl get serviceaccount vault-reviewer -o jsonpath={.secrets[0].name}) \
+  -o jsonpath={.data.token} | base64 -D -
+  export REVIEWER_TOKEN=$(kubectl get secret \
+  $(kubectl get serviceaccount vault-reviewer \
+  -o jsonpath={.secrets[0].name}) -o jsonpath={.data.token} | base64 -D -)
+  && echo $REVIEWER_TOKEN
+  eyJ . . . reg
+
+. Get the API server address:
+
+  $ kubectl config view -o jsonpath='{.clusters[*].cluster.server}'
+  https://api-example-cluster-k8s-l-1dt7vk-41321592.us-east-1.elb.amazonaws.com https://192.168.99.100:8443
++
+This is the address of API servers currently configured. The first one is for the cluster created by kops. Second one is for the minikube server, if its running. The first one is relevant for our case.
++
+. Extract the certificate
+.. Find the default secret token:
+
+  $ kubectl get secrets | grep default
+  default-token-kvjn9          kubernetes.io/service-account-token   3         4d
+
+.. Use the default token name to extract the certificate:
+
+  $ kubectl get secrets default-token-kvjn9 -o jsonpath="{.data['ca\.crt']}" | base64 -D > ~/.kube/kops.crt
+
+. Now that all the required values are available, configure the Kubernetes auth backend.
+.. Mount the Kubernetes auth backend:
+
+  $ vault auth-enable kubernetes
+  Successfully enabled 'kubernetes' at 'kubernetes'!
+
+.. Configure the auth backend:
+
+  $ vault write auth/kubernetes/config \
+    token_reviewer_jwt=$REVIEWER_TOKEN  \
+    kubernetes_host=<api-server> \
+    kubernetes_ca_cert=@~/.kube/kops.crt
++
+For example, here is how our command will look like:
+
+  $ vault write auth/kubernetes/config \
+    token_reviewer_jwt=eyJ . . . reg  \
+    kubernetes_host=https://api-example-cluster-k8s-l-1dt7vk-41321592.us-east-1.elb.amazonaws.com \
+    kubernetes_ca_cert=@~/.kube/kops.crt
+  Success! Data written to: auth/kubernetes/config
+
+. Create a role with service account name `vault-auth` in the `default` namespace:
+
+  $ vault write auth/kubernetes/role/demo \
+    bound_service_account_names=vault-auth \
+    bound_service_account_namespaces=default \
+    policies=kube-auth \
+    period=60s
+  Success! Data written to: auth/kubernetes/role/demo
+
+. Read the role:
+
+  $ vault read auth/kubernetes/role/demo
+  Key                               Value
+  ---                               -----
+  bound_service_account_names       [vault-auth]
+  bound_service_account_namespaces  [default]
+  max_ttl                           0
+  num_uses                          0
+  period                            60
+  policies                          [kube-auth]
+  ttl                               0
+
+. Create a policy for this role
+
+  $ vault policy-write kube-auth templates/kube-auth.hcl
+  Policy 'kube-auth' written.
+
+. Write secrets to Vault:
+
+  $ vault write secret/creds GREETING=Hello NAME=World
+  Success! Data written to: secret/creds
+
+. Check that this value can be read:
+
+  $ vault read -field=GREETING secret/creds
+  Hello
+
+=== Deploy a Pod using secrets from Vault
+
+Let's deploy a Pod that is reading secrets from the Vault server. Here is the sequence of events that need to happen:
+
+- Pod needs to know the address of Vault server. This is passed as `VAULT_ADDR` environment variable.
+- Pod reads the Kubernetes service account token
+- Service account token is passed to Vault server to retrieve a client token
+- Client token is used to authenticate and read secrets from Vault
+
+More details about the Docker image used in the Pod is at https://github.com/arun-gupta/vault-kubernetes.
+
+. The Pod configuration file looks like:
+
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: vault-kubernetes
+  spec:
+    containers:
+    - name: vault-kubernetes
+      image: arungupta/vault-kubernetes:latest
+      env:
+        - name: VAULT_ADDR
+          valueFrom:
+            configMapKeyRef:
+              name: vault
+              key: address
+    restartPolicy: Never
+
+. Create the ConfigMap:
+
+  $ kubectl create configmap vault --from-literal=address=$VAULT_ADDR
+  configmap "vault" created
+
+. Deploy the Pod:
+
+  $ kubectl apply -f templates/pod-vault.yaml 
+  pod "vault-kubernetes" created
+
+. Get the list of Pods:
+
+  $ kubectl get pods --show-all
+  NAME               READY     STATUS      RESTARTS   AGE
+  vault-kubernetes   0/1       Completed   0          20s
+
+. Get logs from the completed Pod:
+
+  $ kubectl logs vault-kubernetes
+  Connecting to Vault: http://ec2-54-237-223-40.compute-1.amazonaws.com:8200
+  vault: HelloWorld
+
 

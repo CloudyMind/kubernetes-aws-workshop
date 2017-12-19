@@ -4,11 +4,15 @@
 
 AWS uses Identity and Access Management (IAM) roles to manage authentication and authorization for AWS Services.  An IAM role is an IAM entity that defines a set of permissions for making AWS service requests. For more information about IAM, please see link:https://aws.amazon.com/iam/details/[here].
 
-Out of the box, Kubernetes supports two types of roles: a master IAM role and a node IAM role.
+Out of the box, a Kubernetes cluster created by kops has two IAM roles: a master IAM role and a node IAM role. Additional policies may be associated with these IAM roles. More details about the IAM roles and associated policies is available at https://github.com/kubernetes/kops/blob/master/docs/iam_roles.md.
 
-In addition, the 3rd party plugin https://github.com/jtblin/kube2iam[kube2iam] can be configured to apply IAM roles at the pod level.
+A Pod may be assigned a specific IAM role using different mechanisms. A third-party plugin such as https://github.com/jtblin/kube2iam[kube2iam] can be configured to apply IAM roles at the pod level. https://www.vaultproject.io/[Hashicorp's Vault] can be used to assign IAM dynamic IAM roles as well.
 
-This exercise will walk you through configuring both concepts.
+This chapter will walk you through:
+
+- Update default policies for the cluster
+- Use kube2iam to assign IAM roles at runtime
+- Use Hashicorp Vault to assign IAM roles at runtime
 
 == Prerequisites
 
@@ -16,9 +20,9 @@ This chapter uses a cluster with 3 master nodes and 5 worker nodes as described 
 
 All configuration files for this chapter are in the `roles` directory.
 
-== IAM Roles for Master Nodes
+== IAM Roles for master nodes
 
-Out of the box, when deploying Kubernetes on AWS, master nodes require a number of EC2, Elastic Load Balancer (ELB), EC2 Container Registry (ECR), Route53, and Key Management Service (KMS) policies applied. The worker nodes require a number of EC2, ECR, and Route53 policies applied.  If using `kops` to install, these will be automatically configured for you (see link:https://github.com/kubernetes/kops/blob/master/docs/iam_roles.md[here] for a full list).
+Kubernetes cluster created using kops has two IAM roles - one for all master nodes and one for all worker nodes. The master IAM role is associated with a number of policies related to EC2, Elastic Load Balancer (ELB), EC2 Container Registry (ECR), Route53, and Key Management Service (KMS). The worker nodes require a number of EC2, ECR, and Route53 policies applied. kops automatically configures these roles and policies for you (see link:https://github.com/kubernetes/kops/blob/master/docs/iam_roles.md[here] for a full list).
 
 These policies may be augmented via `kops`.  For example, to allow all nodes ElasticSearch access, perform the following steps:
 
@@ -58,7 +62,7 @@ In a similar fashion, policies may be applied to all masters by setting the `add
 
 Once again, the cluster needs to be updated for these changes to take effect.
 
-== IAM Container Roles
+== IAM container roles using kube2iam
 
 link:https://github.com/jtblin/kube2iam[Kube2iam] provides different AWS IAM roles for pods running on Kubernetes based on annotations.
 
@@ -95,9 +99,9 @@ The following steps describe how to configure kube2iam:
 +
 Note that the `kube2iam-ds.yaml` is assuming that your network configuration is based on `kubenet`, which is also the default kops configuration. If you have changed this as part of another exercise (e.g. switched to Calico) you will need to change the value of the `--host-interface` arg in the configuration file. For example, set to `cal+` if using Calico.
 
-=== IAM Roles for Worker Nodes
+=== IAM roles for worker nodes
 
-It is necessary to create an IAM role which can assume other roles and assign it to each kubernetes worker.
+It is necessary to create an IAM role which can assume other roles and assign it to each Kubernetes worker.
 
 We need the link:https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html[Amazon Resource Name (ARN)] of the IAM Role assigned to the worker nodes.  We will need this as part of creating pod roles.  We can obtain this by running the following command:
 
@@ -121,9 +125,9 @@ It shows an output like:
 
 Note down the ARN from this output.
 
-Edit the `templates/pod-role-trust-policy.json` file, replace `{{NodeIamRoleARN}}` with the IAM Role ARN obtained from the previous step.
+Edit the `templates/pod-role-trust-policy.json` file, replace `{{NodeIAMRoleARN}}` with the IAM Role ARN obtained from the previous step.
 
-We will first create a role with no permissions.  By configuring the Trusted Policy of the role, we are allowing kube2iam (via the worker node IAM Instance Profile Role) to assume the pod role.  Make note of the role ARN from the response:
+We will first create a role with no permissions. By configuring the Trusted Policy of the role, we are allowing kube2iam (via the worker node IAM Instance Profile Role) to assume the pod role.  Make note of the role ARN from the response:
 
   $ aws iam create-role \
     --role-name MyPodRole \
@@ -163,9 +167,9 @@ It shows an output as:
       }
   }
 
-=== Configure IAM Role on a Pod
+=== Test the Pod with IAM role
 
-`iam.amazonaws.com/role` annotation on the pod is used to assign an IAM role to a pod. Let's set this annotation on our pod. The `templates/aws-cli-po.yaml` file looks like:
+`iam.amazonaws.com/role` annotation on the pod is used to assign an IAM role to a pod. Let's set this annotation on our pod. The `templates/pod-with-kube2iam.yaml` file looks like:
 
   apiVersion: v1
   kind: Pod
@@ -185,26 +189,20 @@ It shows an output as:
 
 Run the following command:
 
-  $ kubectl create -f templates/aws-cli-po.yaml
+  $ kubectl create -f templates/pod-with-kube2iam.yaml
   pod "aws-cli" created
 
 This will create a pod with the AWS CLI already installed, with the `MyPodRole` IAM role assigned.
 
-Log into the `aws-cli` pod that we have just deployed:
+Run the AWS CLI to attempt to access S3:
 
-  $ kubectl exec -it aws-cli /bin/bash
-  bash-4.3#
+```
+$ kubectl exec -it aws-cli aws s3 ls
 
-We will use the AWS CLI to attempt to access S3.  Recall that the `MyPodRole` IAM role that we created has no permissions, therefore the following should fail:
+An error occurred (AccessDenied) when calling the ListBuckets operation: Access Denied
+```
 
-  bash-4.3# aws s3 ls
-  An error occurred (AccessDenied) when calling the ListBuckets operation: Access Denied
-
-Exit the pod:
-
-  bash-4.3# exit
-  exit
-  command terminated with exit code 255
+Recall that the `MyPodRole` IAM role that we created has no permissions and so the access is denied.
 
 Terminate the pod:
 
@@ -215,23 +213,193 @@ Let's update the role to grant S3 permissions:
 
   $ aws iam attach-role-policy --role-name MyPodRole --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
 
-Recreate the pod, log into it, then try to access S3 again.  We should now be authorized!
+Recreate the pod and then try to access S3 again.
 
-  $ kubectl create -f templates/aws-cli-po.yaml
-  pod "aws-cli" created
+```
+$ kubectl create -f templates/pod-with-kube2iam.yaml
+pod "aws-cli" created
 
-  $ kubectl exec -it aws-cli /bin/bash
-  bash-4.3# aws s3 ls
+$ kubectl exec -it aws-cli aws s3 ls
+```
 
-The output should show the list of S3 buckets.
+We should now be authorized and the output should show the list of S3 buckets in this IAM account.
 
-=== Additional Notes
+=== Additional notes
 
 As kube2iam caches STS tokens for 15 minutes, if you make any changes to a role and need it to take effect immediately, you will need to restart the pod.
 
-To govern what roles a pod can assume, you can use the `iam.amazonaws.com/allowed-roles` namespace annotation. Edit the `templates/namespace-role-annotation.yaml` file, replace `{{NodeIamRoleARN}}` with the IAM Role ARN obtained from the previous step and run the following command:
+To govern what roles a pod can assume, you can use the `iam.amazonaws.com/allowed-roles` namespace annotation. Edit the `templates/namespace-role-annotation.yaml` file, replace `{{NodeIAMRoleARN}}` with the IAM Role ARN obtained from the previous step and run the following command:
 
     $ kubectl apply -f templates/namespace-role-annotation.yaml
     namespace "default" configured
 
 From now on, pods in the default namespace will only be able to optain the `MyPodRole`.
+
+== IAM container roles using Hashicorp Vault
+
+Hashicorp Vault is a tool for securely accessing secrets. The secrets could be static where they are retrieved from a key-value store or could be dynamically generated when needed such as IAM credentials. This is enabled by the pluggable architecture of Vault that supports different backends. Vault behaves like a virtual filesystem where each backend is mounted at a specific path. For example, by default, https://www.vaultproject.io/docs/auth/aws.html[AWS backend] is mounted at the path `aws`. An alternative path can be specified using `-path` at mount time.
+
+Each Vault backend reacts differently to different Vault CLI commands. For example, the command `vault read aws/deploy` will generate an access key based on the `"deploy"` role in the context of Vault/AWS secret backend. This role contains an IAM role or ARN mapping.
+
+Make sure to setup Vault as explained in:
+
+. link:../config-secrets#create-ec2-instance[Create EC2 instance]
+. link:../config-secrets#start-vault-server-on-ec2[Start Vault Server on EC2]
+. link:../config-secrets#configure-vault-cli-on-your-local-machine[Configure Vault CLI on your local machine]
+. link:../config-secrets#configure-kubernetes-service-account[Configure Kubernetes Service Account]
+. link:../config-secrets#configure-kubernetes-auth-backend[Configure Kubernetes Auth backend]
+
+And now follow the steps outlined here.
+
+The steps in this section are inspired from https://github.com/calvn/vault-kubernetes-demo/blob/master/5-deploy-aws.md.
+
+=== Setup AWS account
+
+Create an IAM user with enough permissions to manage IAM resources. We will be using the `IAMFullAccess` policy here, but a more locked down custom policy can be provided. For an example on such policy template, refer to the Vault documentation regarding the backend's https://www.vaultproject.io/docs/secrets/aws/index.html#root-credentials-for-dynamic-iam-users[root credentials].
+
+. Create the user:
+
+  $ aws iam create-user \
+       --user-name vault-root
+  {
+      "User": {
+          "UserName": "vault-root", 
+          "Path": "/", 
+          "CreateDate": "2017-11-22T20:13:39.273Z", 
+          "UserId": "AIDAI6SQOXCLURVV2J7BK", 
+          "Arn": "arn:aws:iam::<account-id>:user/vault-root"
+      }
+  }
+
+. Attach the `IAMFullAccess` policy to the user:
+
+  $ aws iam attach-user-policy \
+       --user-name vault-root \
+       --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+
+. Generate a access key and secret access key pair:
++
+```
+$ aws iam create-access-key \
+     --user-name vault-root
+
+{
+    "AccessKey": {
+        "UserName": "vault-root", 
+        "Status": "Active", 
+        "CreateDate": "2017-11-22T20:14:00.682Z", 
+        "SecretAccessKey": "<secret-key>", 
+        "AccessKeyId": "<access-key>"
+    }
+}
+```
+
+=== Setup Vault and AWS backend
+
+. Create a policy for this role:
+
+  $ vault policy-write kube-auth templates/kube-auth.hcl
+  Policy 'kube-auth' written.
+
+. Check the policy:
++
+```
+$ vault policies kube-auth
+path "secret/creds" {
+  capabilities = ["read"]
+}
+
+path "aws/creds/readonly" {
+  capabilities = ["read"]
+}
+```
++
+. Mount AWS backend:
+
+  $ vault mount aws
+  Successfully mounted 'aws' at 'aws'!
+
+. Configure the AWS secret backend:
+
+  $ vault write aws/config/root \
+    secret_key=<secret-key> \
+    access_key=<access-key> \
+    region=us-east-1
+  Success! Data written to: aws/config/root
+
+. Create a AWS secret backend role that has read-only permissions on EC2 instances for the account using a AWS managed policy this policy:
+
+  $ vault write aws/roles/readonly \
+    arn=arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+  Success! Data written to: aws/roles/readonly
+
+=== Test the Pod with IAM role
+
+Pod will be using this role to request IAM credentials during runtime.
+
+. Edit `templates/deplloymnet-with-vault.yaml` to replace `<public-ip-address>` with the public IP address of the EC2 instance where Vault server is running.
+. Create the Pod:
+
+  $ kubectl apply -f templates/deployment-with-vault.yaml
+  deployment "vault-sidecar" created
+
+. Get the list of Deployment:
+
+  $ kubectl get deployment
+  NAME            DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGE
+  vault-sidecar   1         1         1            1           10s
+
+. Get the list of Pod:
+
+  $ kubectl get pods -l app=vault-sidecar
+  NAME                             READY     STATUS    RESTARTS   AGE
+  vault-sidecar-79bbc86955-wwlkb   2/2       Running   0          35s
+
+. Use AWS CLI:
++
+```
+$ kubectl exec -it $(kubectl get pods -l app=vault-sidecar -o jsonpath={.items[0].metadata.name}) aws s3 ls
+Defaulting container name to aws-cli.
+Use 'kubectl describe pod/vault-sidecar-79bbc86955-h4pkf' to see all of the containers in this pod.
+
+An error occurred (AccessDenied) when calling the ListBuckets operation: Access Denied
+command terminated with exit code 255
+```
++
+This is expected because the AWS secret backend gives access to `AmazonEC2ReadOnlyAccess` only.
++
+. Update the AWS secret backend to allow access to S3:
+
+  $ vault write aws/roles/readonly \
+    arn=arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+  Success! Data written to: aws/roles/readonly
+
+. We need to generate a new set of AWS credentials after the policy is updated. In order for this policy to take effect, we need to restart the sidecar container. But its easier to delete and create the Deployment again.
+
+that reads the credentials from Vault. This will allow the new policy to take effect. But its easier to delete the Deployment.
+
+  $ kubectl delete -f templates/deployment-with-vault.yaml
+  deployment "vault-sidecar" deleted
+
+. Create the Deployment again:
+
+  $ kubectl apply -f templates/deployment-with-vault.yaml
+  deployment "aws-sidecar-example" created
+
+. Use AWS CLI:
+
+  $ kubectl exec -it $(kubectl get pods -l app=vault-sidecar -o jsonpath={.items[0].metadata.name}) aws s3 ls
++
+And this shows the listing of S3 buckets in your account.
++
+. Kubernetes Auth backend is configured for the token to expire in 60 seconds. This was done during Kubernetes Auth backend configuration by setting the `-period=60s` on the `vault write auth/kubernetes/role/demo` command. This means the temporary IAM role created for this Deployment will eventually disappear. Trying to access the S3 listing after a few minutes will give an error:
++
+```
+$ kubectl exec -it $(kubectl get pods -l app=vault-sidecar -o jsonpath={.items[0].metadata.name}) aws s3 ls
+Defaulting container name to aws-cli.
+Use 'kubectl describe pod/vault-sidecar-79bbc86955-7wpt6' to see all of the containers in this pod.
+
+An error occurred (InvalidAccessKeyId) when calling the ListBuckets operation: The AWS Access Key Id you provided does not exist in our records.
+command terminated with exit code 255
+```
+
